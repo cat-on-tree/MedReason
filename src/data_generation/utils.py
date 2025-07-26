@@ -1,4 +1,5 @@
-from openai import AzureOpenAI  # openai>=1.0.0
+from openai import OpenAI
+import os
 import time
 import json
 import networkx as nx
@@ -13,22 +14,24 @@ import logging
 api_total_cost = 0.0
 
 clients = {
-    "gpt-4": {
-        'endpoint': "YOUR AZURE ENDPOINT",
-        'api_key': "YOUR API KEY",
-        'api_version': "2024-12-01-preview",
-        'name': 'gpt-4-1106-preview-nofilter',
-        'input_price': 2.75 / 10 ** 6,  # input price per Million tokens
-        'output_price': 11.0 / 10 ** 6, # output price per Million tokens
-        },
-    "gpt-4o": {
-        'endpoint': "YOUR AZURE ENDPOINT",
-        'api_key': "YOUR API KEY",
-        'api_version': "2024-12-01-preview",
-        'name': 'gpt-4o-0806-nofilter-global',
-        'input_price': 2.75 / 10 ** 6, # input price per Million tokens
-        'output_price': 11.0 / 10 ** 6, # output price per Million tokens
-        }
+    "qwen-plus": {
+        'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        'input_price': 0.0008 / 1000,   # 元/Token
+        'output_price': 0.002 / 1000,   # 元/Token
+        'model': "qwen-plus",
+    },
+    "qwen-max": {
+        'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        'input_price': 0.0024 / 1000,
+        'output_price': 0.0096 / 1000,
+        'model': "qwen-max",
+    },
+    "qwen-turbo": {
+        'base_url': "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        'input_price': 0.0003 / 1000,
+        'output_price': 0.0006 / 1000,
+        'model': "qwen-turbo",
+    },
 }
 
 def init_logger(name=''):
@@ -108,71 +111,56 @@ def generate_node_embeddings(knowledge_graph_path = '/path/to/kg.csv', emb_model
     torch.save(nodeemb_dict, 'node_embeddings.pt')
     return
 
-def compute_usage(response, engine):
-    usage = response.usage.to_dict()
-    input = usage["prompt_tokens"]
-    reasoning = 0 if "completion_tokens_details" not in usage else usage["completion_tokens_details"]["reasoning_tokens"]
-    output = usage["completion_tokens"] - reasoning
-
-    cost = {
-        "input": input * clients[engine]['input_price'],
-        "output": output * clients[engine]['output_price'],
+def compute_usage(usage, engine):
+    input_tokens = usage.prompt_tokens
+    output_tokens = usage.completion_tokens
+    input_price = clients[engine]['input_price']
+    output_price = clients[engine]['output_price']
+    cost = input_tokens * input_price + output_tokens * output_price
+    return {
+        "input": input_tokens * input_price,
+        "output": output_tokens * output_price,
+        "total": cost,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
     }
 
-    cost["total"] = sum(cost.values())
-
-    return cost
-
-def run_llm(prompt, temperature = 0.0, max_tokens = 3000, engine="gpt-4o", max_attempt = 10):
-    global api_total_cost  # declare to modify the global variable
-    client = AzureOpenAI(
-        azure_endpoint=clients[engine]['endpoint'],
-        api_key=clients[engine]['api_key'],
-        api_version=clients[engine]['api_version']
+def run_llm(prompt, temperature=0.0, max_tokens=3000, engine="qwen-max", max_attempt=10, response_format=None):
+    global api_total_cost
+    client = OpenAI(
+        api_key=os.getenv("DASHSCOPE_API_KEY"),
+        base_url=clients[engine]['base_url'],
     )
-        
-    if engine == "o1-preview":
-        messages = []
-    else:
-        messages = [{"role":"system","content":"You are an AI assistant that helps people find information."}]
-    message_prompt = {"role":"user","content":prompt}
-    messages.append(message_prompt)
-    flag = 0
-    while(flag == 0 and max_attempt > 0):
-        max_attempt -= 1
+    messages = [
+        {"role": "system", "content": "You are an AI assistant that helps people find information."},
+        {"role": "user", "content": prompt}
+    ]
+    attempt = 0
+    while attempt < max_attempt:
         try:
-            if engine in {"o1", "o3-mini", "o1-preview"}:
-                response = client.chat.completions.create(
-                    model=clients[engine]['name'],
-                    messages = messages,
-                    max_completion_tokens=max_tokens,
-                    frequency_penalty=0,)
-            elif engine == "gpt-3.5-turbo" or engine == "gpt-4":
-                response = client.chat.completions.create(
-                    model=clients[engine]['name'],
-                    messages = messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens + len(messages[0]['content']),
-                    frequency_penalty=0,)
-            else:
-                response = client.chat.completions.create(
-                    model=clients[engine]['name'],
-                    messages = messages,
-                    temperature=temperature,
-                    max_completion_tokens=max_tokens,
-                    frequency_penalty=0,)
-            result = response.choices[0].message.content
-            cost = compute_usage(response, engine)
-            # Update the global API cost counter
-            api_total_cost += cost["total"]
-            # print(f"Total API cost so far (accumulated in run_llm calls): {api_total_cost}")
-            flag = 1
+            completion = client.chat.completions.create(
+                model=clients[engine]['model'],
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format if response_format else None,
+            )
+            result = completion.choices[0].message.content
+            usage = completion.usage
+            # 价格统计
+            input_tokens = usage.prompt_tokens
+            output_tokens = usage.completion_tokens
+            input_price = clients[engine]['input_price']
+            output_price = clients[engine]['output_price']
+            cost = input_tokens * input_price + output_tokens * output_price
+            api_total_cost += cost
+            return result
         except Exception as e:
-            print(e)
-            result= "openai error, retry"
-            print("openai error, retry")
+            print(f"错误信息：{e}")
+            print("请参考文档：https://help.aliyun.com/zh/model-studio/developer-reference/error-code")
             time.sleep(2)
-    return result
+            attempt += 1
+    return "qwen error, retry"
     
 def coarse_entity_extraction(text,temperature = 0.0, max_tokens = 3000, engine="gpt-4o"):
     Extract_prompt = """ You are a helpful, pattern-following medical assistant. 

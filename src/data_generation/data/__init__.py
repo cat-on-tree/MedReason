@@ -1,1 +1,1 @@
-from data.dataset import QADataset
+from .dataset import QADataset
